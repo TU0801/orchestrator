@@ -50,6 +50,38 @@ class ImprovementEngine:
         logger.addHandler(handler)
         return logger
 
+    def get_project_config(self, project_id: str) -> dict:
+        """
+        プロジェクト設定をDBから取得
+
+        Returns:
+            {
+                'directory': str,  # ローカルディレクトリパス
+                'session_name': str,  # Resume セッション名
+                'repo_url': str  # リポジトリURL
+            }
+        """
+        try:
+            result = self.supabase.table('orch_projects').select(
+                'local_directory, resume_session_name, repository_url'
+            ).eq('id', project_id).single().execute()
+
+            if result.data:
+                return {
+                    'directory': result.data.get('local_directory') or project_id,
+                    'session_name': result.data.get('resume_session_name') or f"orch-{project_id}",
+                    'repo_url': result.data.get('repository_url')
+                }
+        except Exception as e:
+            self.logger.warning(f"Failed to get project config from DB: {e}. Using defaults.")
+
+        # デフォルト設定
+        return {
+            'directory': project_id,
+            'session_name': f"orch-{project_id}",
+            'repo_url': None
+        }
+
     def check_triggers(self, project_id: str) -> Optional[Dict[str, Any]]:
         """
         改善トリガーをチェック
@@ -270,17 +302,9 @@ class ImprovementEngine:
             成功したらTrue
         """
         try:
-            # プロジェクトディレクトリを取得
-            project_dir_mapping = {
-                'idiom': 'idiom-metaphor-analyzer',
-                'orchestrator-dashboard': 'orchestrator-dashboard',
-                'docflow': 'docflow',
-                'tagless': 'tagless',
-                'orchestrator': '../orchestrator'
-            }
-
-            dir_name = project_dir_mapping.get(project_id, project_id)
-            project_dir = self.projects_dir / dir_name
+            # プロジェクト設定をDBから取得
+            config = self.get_project_config(project_id)
+            project_dir = self.projects_dir / config['directory']
 
             if not project_dir.exists():
                 self.logger.error(f"Project directory not found: {project_dir}")
@@ -495,17 +519,9 @@ Improvements applied:
     def _record_knowledge_assets(self, project_id: str, target_files: List[str], branch_name: str):
         """作成されたスキル/エージェント設定をorch_knowledge_assetsに記録"""
         try:
-            # プロジェクトディレクトリを取得
-            project_dir_mapping = {
-                'idiom': 'idiom-metaphor-analyzer',
-                'orchestrator-dashboard': 'orchestrator-dashboard',
-                'docflow': 'docflow',
-                'tagless': 'tagless',
-                'orchestrator': '../orchestrator'
-            }
-
-            dir_name = project_dir_mapping.get(project_id, project_id)
-            project_dir = self.projects_dir / dir_name
+            # プロジェクト設定をDBから取得
+            config = self.get_project_config(project_id)
+            project_dir = self.projects_dir / config['directory']
 
             for file_path in target_files:
                 # .claude/配下のファイルのみ記録

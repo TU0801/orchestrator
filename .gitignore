@@ -6,7 +6,8 @@ logs/
 *.log
 
 # Database
-db/
+db/*
+!db/migrations/
 
 # Inbox/Outbox (temporary files)
 inbox/

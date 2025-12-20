@@ -210,6 +210,38 @@ class TaskExecutor:
             self.logger.error(f"Supabase接続エラー: {e}")
             return False
 
+    def get_project_config(self, project_id: str) -> dict:
+        """
+        プロジェクト設定をDBから取得
+
+        Returns:
+            {
+                'directory': str,  # ローカルディレクトリパス
+                'session_name': str,  # Resume セッション名
+                'repo_url': str  # リポジトリURL
+            }
+        """
+        try:
+            result = self.supabase.table('orch_projects').select(
+                'local_directory, resume_session_name, repository_url'
+            ).eq('id', project_id).single().execute()
+
+            if result.data:
+                return {
+                    'directory': result.data.get('local_directory') or project_id,
+                    'session_name': result.data.get('resume_session_name') or f"orch-{project_id}",
+                    'repo_url': result.data.get('repository_url')
+                }
+        except Exception as e:
+            self.logger.warning(f"Failed to get project config from DB: {e}. Using defaults.")
+
+        # デフォルト設定
+        return {
+            'directory': project_id,
+            'session_name': f"orch-{project_id}",
+            'repo_url': None
+        }
+
     def get_pending_tasks(self) -> list:
         """pendingタスクを取得"""
         try:
@@ -571,17 +603,9 @@ class TaskExecutor:
 
     def execute_with_claude_code(self, project_id: str, instruction: str) -> tuple[bool, int, str]:
         """Claude Codeでタスクを実行"""
-        # プロジェクトIDとディレクトリ名のマッピング
-        project_dir_mapping = {
-            'idiom': 'idiom-metaphor-analyzer',
-            'orchestrator-dashboard': 'orchestrator-dashboard',
-            'docflow': 'docflow',
-            'tagless': 'tagless',
-            'orchestrator': '../orchestrator'  # orchestratorは~/orchestratorにある
-        }
-
-        dir_name = project_dir_mapping.get(project_id, project_id)
-        project_dir = self.projects_dir / dir_name
+        # プロジェクト設定をDBから取得
+        config = self.get_project_config(project_id)
+        project_dir = self.projects_dir / config['directory']
 
         if not project_dir.exists():
             error_msg = f"プロジェクトディレクトリが見つかりません: {project_dir}"
@@ -633,18 +657,38 @@ orchestrator-dashboardから指示が投入されました。
         self.logger.info(f"Claude Codeを起動: プロジェクト={project_id}")
         self.logger.debug(f"指示内容:\n{full_instruction}")
 
+        # セッション名を取得
+        session_name = config['session_name']
+
         try:
             # 一時ファイルに指示を書き出す（改行・エスケープ問題を回避）
             temp_instruction_file = Path('/tmp') / f'orchestrator_task_{self.current_task_id}.txt'
             temp_instruction_file.write_text(full_instruction, encoding='utf-8')
 
-            # claudeコマンドを実行（非対話モード）
+            # Step 1: Resumeを試みる
+            self.logger.info(f"Trying to resume session: {session_name}")
+            resume_cmd = f'cd {project_dir} && cat {temp_instruction_file} | claude --resume {session_name} --dangerously-skip-permissions --print'
+
             result = subprocess.run(
-                ['bash', '-c', f'cd {project_dir} && cat {temp_instruction_file} | claude --dangerously-skip-permissions --print'],
+                ['bash', '-c', resume_cmd],
                 capture_output=True,
                 text=True,
                 timeout=600  # 10分でタイムアウト
             )
+
+            # Resumeが失敗した場合は新規セッションで再試行
+            if result.returncode != 0 and ('session not found' in result.stderr.lower() or 'no such session' in result.stderr.lower()):
+                self.logger.info(f"Resume failed, starting new session with name: {session_name}")
+                new_session_cmd = f'cd {project_dir} && cat {temp_instruction_file} | claude --session {session_name} --dangerously-skip-permissions --print'
+
+                result = subprocess.run(
+                    ['bash', '-c', new_session_cmd],
+                    capture_output=True,
+                    text=True,
+                    timeout=600
+                )
+            elif result.returncode == 0:
+                self.logger.info(f"Successfully resumed session: {session_name}")
 
             # 一時ファイルを削除
             temp_instruction_file.unlink(missing_ok=True)
