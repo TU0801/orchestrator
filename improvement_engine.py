@@ -261,7 +261,7 @@ class ImprovementEngine:
             branch_name = f"auto-improvement-{timestamp}"
 
             # 改善内容を生成するプロンプト
-            improvement_prompt = f"""## 自動改善タスク
+            improvement_prompt = f"""## 自動改善タスク - スキル/エージェント最適化
 
 プロジェクト: {project_id}
 
@@ -274,18 +274,62 @@ class ImprovementEngine:
 
 ## 指示
 
-上記の改善提案に基づいて、プロジェクトのコード、CLAUDE.md、またはスキルを改善してください。
+上記の失敗パターンと改善提案に基づいて、以下を実行してください：
 
-重要:
-- 変更は慎重に行い、既存の機能を壊さないこと
-- CLAUDE.mdに改善内容を記録すること
-- 変更理由を明確にすること
-- 実装後、変更内容をサマリーとして出力すること
+### 1. スキル管理
+- `.claude/skills/` ディレクトリを確認・作成
+- 失敗パターンに対応する新しいスキルファイルを作成
+  * 例: 同じエラーが繰り返される場合、そのエラーハンドリング用スキルを作成
+  * スキルファイル名: `{project_id}-[purpose].sh` または `.py`
+  * スキル内容: 再利用可能なコマンド/パターンを定義
+- 既存スキルの更新または削除（使われていないスキルは削除）
 
-出力形式:
+### 2. エージェント設定
+- `.claude/agents/` ディレクトリを確認・作成（必要に応じて）
+- プロジェクト固有のエージェント設定を作成
+  * カスタムプロンプトテンプレート
+  * ツール使用ポリシー
+  * 失敗を避けるためのガードレール
+
+### 3. サブエージェント構成
+- タスクが複雑な場合、サブエージェントの組み立て戦略を `.claude/subagents.md` に記録
+- どのタスクをどのエージェントに分割すべきかの判断基準
+
+### 4. 外部リソース活用
+- 類似の問題を解決する公開スキル/パターンがあれば参考にする
+- 必要に応じて有用なスクリプトやツールを `.claude/tools/` に配置
+
+### 5. CLAUDE.md更新
+- 今回の失敗パターンと対策を記録
+- スキル/エージェント構成の変更を文書化
+- 「失敗から学んだこと」セクションを追加
+
+### 6. コード改善（必要に応じて）
+- 根本的なコード問題があれば修正
+- ただしスキル/エージェント強化を優先
+
+## 重要な注意事項
+- 既存の機能を壊さないこと
+- スキルファイルは実行可能で、明確なドキュメントを含むこと
+- 変更は段階的に（一度に多くを変えすぎない）
+- テスト可能な形で実装すること
+
+## 出力形式
+
 ```changes
-ファイル1: path/to/file1 - 変更内容の説明
-ファイル2: path/to/file2 - 変更内容の説明
+.claude/skills/[新規スキル].sh - [目的と機能の説明]
+.claude/agents/[設定ファイル] - [エージェント設定の説明]
+CLAUDE.md - [失敗パターンと対策を追記]
+[その他の変更ファイル] - [説明]
+```
+
+```skills-created
+スキル名: [名前]
+目的: [このスキルが解決する問題]
+使い方: [実行方法]
+---
+スキル名: [名前]
+...
 ```
 """
 
@@ -359,8 +403,9 @@ Improvements applied:
     def _record_improvement_history(self, project_id: str, trigger: Dict[str, Any], branch_name: str, output: str):
         """改善履歴を記録"""
         try:
-            # 変更ファイルを抽出
             import re
+
+            # 変更ファイルを抽出
             changes_match = re.search(r'```changes\s*\n(.*?)\n```', output, re.DOTALL)
             changes_summary = changes_match.group(1) if changes_match else "No summary provided"
 
@@ -372,19 +417,93 @@ Improvements applied:
                         file_path = line.split(':')[0].strip()
                         target_files.append(file_path)
 
+            # 作成されたスキルを抽出
+            skills_match = re.search(r'```skills-created\s*\n(.*?)\n```', output, re.DOTALL)
+            skills_created = []
+            if skills_match:
+                skill_blocks = skills_match.group(1).split('---')
+                for block in skill_blocks:
+                    if 'スキル名:' in block:
+                        skills_created.append(block.strip())
+
+            # orch_improvement_historyに保存
             self.supabase.table('orch_improvement_history').insert({
                 'project_id': project_id,
                 'trigger_type': trigger['trigger_type'],
                 'trigger_details': json.dumps(trigger['details']),
                 'target_files': json.dumps(target_files),
-                'changes_summary': changes_summary,
+                'changes_summary': changes_summary + (f"\n\n## Created Skills:\n{chr(10).join(skills_created)}" if skills_created else ""),
                 'before_avg_score': trigger['details'].get('average_score', 0.0)
             }).execute()
 
+            # 作成されたスキルファイルをorch_knowledge_assetsに記録
+            self._record_knowledge_assets(project_id, target_files, branch_name)
+
             self.logger.info(f"Improvement history recorded for {project_id}")
+            if skills_created:
+                self.logger.info(f"Created {len(skills_created)} new skills")
 
         except Exception as e:
             self.logger.error(f"Error recording improvement history: {e}")
+
+    def _record_knowledge_assets(self, project_id: str, target_files: List[str], branch_name: str):
+        """作成されたスキル/エージェント設定をorch_knowledge_assetsに記録"""
+        try:
+            # プロジェクトディレクトリを取得
+            project_dir_mapping = {
+                'idiom': 'idiom-metaphor-analyzer',
+                'orchestrator-dashboard': 'orchestrator-dashboard',
+                'docflow': 'docflow',
+                'tagless': 'tagless',
+                'orchestrator': '../orchestrator'
+            }
+
+            dir_name = project_dir_mapping.get(project_id, project_id)
+            project_dir = self.projects_dir / dir_name
+
+            for file_path in target_files:
+                # .claude/配下のファイルのみ記録
+                if not file_path.startswith('.claude/'):
+                    continue
+
+                # ファイルタイプを判定
+                if '/skills/' in file_path:
+                    asset_type = 'skill'
+                elif '/agents/' in file_path:
+                    asset_type = 'agent'
+                elif 'subagents.md' in file_path:
+                    asset_type = 'subagent_config'
+                else:
+                    asset_type = 'other'
+
+                # ファイル内容を読み込み
+                full_path = project_dir / file_path
+                if not full_path.exists():
+                    continue
+
+                try:
+                    content = full_path.read_text(encoding='utf-8')
+                    content_hash = hashlib.sha256(content.encode()).hexdigest()
+
+                    # orch_knowledge_assetsに保存
+                    self.supabase.table('orch_knowledge_assets').insert({
+                        'project_id': project_id,
+                        'asset_type': asset_type,
+                        'file_path': file_path,
+                        'content': content,
+                        'content_hash': content_hash,
+                        'version': 1,
+                        'auto_generated': True,
+                        'created_by': 'improvement_engine'
+                    }).execute()
+
+                    self.logger.info(f"Recorded knowledge asset: {file_path} ({asset_type})")
+
+                except Exception as e:
+                    self.logger.warning(f"Failed to record knowledge asset {file_path}: {e}")
+
+        except Exception as e:
+            self.logger.error(f"Error recording knowledge assets: {e}")
 
     def run_improvement_check(self, project_id: str):
         """改善チェックを実行"""
