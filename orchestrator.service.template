@@ -1,0 +1,24 @@
+[Unit]
+Description=Autonomous Project Orchestrator
+After=network.target
+
+[Service]
+Type=simple
+User=sorakun_fukuoka
+Group=sorakun_fukuoka
+WorkingDirectory=/home/sorakun_fukuoka/orchestrator
+ExecStart=/usr/bin/python3 /home/sorakun_fukuoka/orchestrator/master.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/home/sorakun_fukuoka/orchestrator/logs/orchestrator.log
+StandardError=append:/home/sorakun_fukuoka/orchestrator/logs/orchestrator_error.log
+
+# Environment
+Environment="PYTHONUNBUFFERED=1"
+
+# セキュリティ設定
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

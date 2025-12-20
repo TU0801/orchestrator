@@ -1,0 +1,29 @@
+{
+  "projects": [
+    {
+      "name": "idiom",
+      "path": "/home/sorakun_fukuoka/projects/idiom-metaphor-analyzer",
+      "priority": "high",
+      "tmux_session": "idiom",
+      "auto_scan": true,
+      "description": "慣用句認知メタファー分析ツール"
+    }
+  ],
+  "settings": {
+    "scan_interval_seconds": 60,
+    "disk_warning_threshold": 80,
+    "notification": "file",
+    "max_concurrent_tasks": 3,
+    "log_retention_days": 30,
+    "inbox_check_interval": 10,
+    "gdrive_sync_enabled": true,
+    "gdrive_sync_interval": 300,
+    "gdrive_folder_name": "orchestrator_status"
+  },
+  "paths": {
+    "inbox": "/home/sorakun_fukuoka/orchestrator/inbox",
+    "outbox": "/home/sorakun_fukuoka/orchestrator/outbox",
+    "logs": "/home/sorakun_fukuoka/orchestrator/logs",
+    "db": "/home/sorakun_fukuoka/orchestrator/db/orchestrator.db"
+  }
+}
