@@ -402,6 +402,109 @@ class TaskExecutor:
         except Exception as e:
             self.logger.error(f"Failed to save tool calls: {e}")
 
+    def _perform_self_evaluation(self, run_id: int, task_id: int, instruction: str, output: str, success: bool, exit_code: int):
+        """タスク実行結果を自己評価してorch_evaluationsに保存"""
+        try:
+            # 評価プロンプトを構築
+            evaluation_prompt = f"""あなたは自分自身の実行を評価するAIです。以下のタスク実行を評価してください。
+
+## タスク指示
+{instruction}
+
+## 実行結果
+成功: {success}
+終了コード: {exit_code}
+
+## 出力（最初の3000文字）
+{output[:3000]}
+
+## 評価項目
+
+以下の形式でJSON形式で評価を返してください：
+
+```json
+{{
+  "overall_score": <1-10の数値>,
+  "failure_category": "<失敗した場合のカテゴリ: tool_usage_error, permission_error, logic_error, timeout, unknown, または null>",
+  "evaluation_details": {{
+    "task_completion": "<タスクが完了したかどうか>",
+    "quality": "<実装の質>",
+    "efficiency": "<効率性>"
+  }},
+  "improvement_suggestions": [
+    "<改善提案1>",
+    "<改善提案2>",
+    "<改善提案3>"
+  ],
+  "tool_usage_analysis": {{
+    "appropriate_tools": <適切なツールを使用したか: true/false>,
+    "tool_sequence": "<ツール呼び出しの順序は適切だったか>"
+  }},
+  "error_patterns": [
+    "<検出されたエラーパターン>"
+  ]
+}}
+```
+
+注意:
+- overall_scoreは1-10で評価（10が最高）
+- 成功した場合はfailure_categoryをnullに
+- 具体的で実行可能な改善提案を3つ以上
+"""
+
+            self.logger.info(f"Performing self-evaluation for run #{run_id}")
+
+            # 一時ファイルに評価プロンプトを書き出す
+            temp_eval_file = Path('/tmp') / f'orchestrator_eval_{run_id}.txt'
+            temp_eval_file.write_text(evaluation_prompt, encoding='utf-8')
+
+            # Claude APIを使って評価を取得（claudeコマンド経由）
+            result = subprocess.run(
+                ['bash', '-c', f'cat {temp_eval_file} | claude --dangerously-skip-permissions --print'],
+                capture_output=True,
+                text=True,
+                timeout=120  # 2分でタイムアウト
+            )
+
+            # 一時ファイルを削除
+            temp_eval_file.unlink(missing_ok=True)
+
+            if result.returncode != 0:
+                self.logger.warning(f"Evaluation failed with exit code {result.returncode}")
+                return
+
+            eval_output = result.stdout
+
+            # JSON部分を抽出
+            json_match = re.search(r'```json\s*\n(.*?)\n```', eval_output, re.DOTALL)
+            if not json_match:
+                self.logger.warning("Failed to extract JSON from evaluation output")
+                return
+
+            evaluation_data = json.loads(json_match.group(1))
+
+            # orch_evaluationsに保存
+            self.supabase.table('orch_evaluations').insert({
+                'run_id': run_id,
+                'task_id': task_id,
+                'overall_score': evaluation_data.get('overall_score', 5.0),
+                'failure_category': evaluation_data.get('failure_category'),
+                'evaluation_details': json.dumps(evaluation_data.get('evaluation_details', {})),
+                'improvement_suggestions': json.dumps(evaluation_data.get('improvement_suggestions', [])),
+                'tool_usage_analysis': json.dumps(evaluation_data.get('tool_usage_analysis', {})),
+                'error_patterns': json.dumps(evaluation_data.get('error_patterns', [])),
+                'evaluator': 'claude_code'
+            }).execute()
+
+            self.logger.info(f"Self-evaluation saved for run #{run_id}: score={evaluation_data.get('overall_score')}")
+
+        except subprocess.TimeoutExpired:
+            self.logger.warning("Self-evaluation timed out")
+        except json.JSONDecodeError as e:
+            self.logger.warning(f"Failed to parse evaluation JSON: {e}")
+        except Exception as e:
+            self.logger.error(f"Self-evaluation error: {e}")
+
     def execute_with_claude_code(self, project_id: str, instruction: str) -> tuple[bool, int, str]:
         """Claude Codeでタスクを実行"""
         # プロジェクトIDとディレクトリ名のマッピング
@@ -533,6 +636,8 @@ orchestrator-dashboardから指示が投入されました。
             self._complete_run_record(run_id, success, exit_code, output, duration_seconds)
             # ツール呼び出しを解析して保存
             self._save_tool_calls(run_id, output)
+            # 自己評価を実行
+            self._perform_self_evaluation(run_id, task_id, instruction, output, success, exit_code)
 
         # 結果を記録（既存のタスクステータス更新）
         if success:
