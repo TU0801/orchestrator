@@ -193,48 +193,78 @@ class ImprovementEngine:
             self.logger.error(f"Error checking cooldown: {e}")
             return False
 
-    def aggregate_improvements(self, run_ids: List[int]) -> List[str]:
+    def aggregate_improvements(self, run_ids: List[int]) -> Dict[str, Any]:
         """
-        評価から改善提案を集約
+        評価から改善提案を集約（スキル・エージェント評価を含む）
 
         Args:
             run_ids: 対象のrun IDリスト
 
         Returns:
-            改善提案のリスト
+            改善提案の辞書（suggestions, ineffective_skills, missing_skills, agent_suggestions）
         """
         try:
             response = self.supabase.table('orch_evaluations') \
-                .select('improvement_suggestions') \
+                .select('improvement_suggestions, tool_usage_analysis') \
                 .in_('run_id', run_ids) \
                 .execute()
 
             evaluations = response.data or []
             all_suggestions = []
+            ineffective_skills = []
+            missing_skills = []
+            agent_suggestions = []
 
             for evaluation in evaluations:
                 try:
+                    # 一般的な改善提案
                     suggestions = json.loads(evaluation['improvement_suggestions'])
                     all_suggestions.extend(suggestions)
+
+                    # スキル・エージェント評価
+                    tool_usage = json.loads(evaluation.get('tool_usage_analysis', '{}'))
+                    skill_eff = tool_usage.get('skill_effectiveness', {})
+                    agent_eff = tool_usage.get('agent_effectiveness', {})
+
+                    # 効果のないスキル
+                    if skill_eff.get('ineffective_skills'):
+                        ineffective_skills.extend(skill_eff['ineffective_skills'])
+
+                    # 不足しているスキル
+                    if skill_eff.get('missing_skills'):
+                        missing_skills.extend(skill_eff['missing_skills'])
+
+                    # エージェント改善提案
+                    if agent_eff.get('better_agent_suggestion'):
+                        agent_suggestions.append(agent_eff['better_agent_suggestion'])
+
                 except (json.JSONDecodeError, TypeError):
                     continue
 
-            # 重複を除去
-            unique_suggestions = list(set(all_suggestions))
-            return unique_suggestions
+            return {
+                'suggestions': list(set(all_suggestions)),
+                'ineffective_skills': list(set(ineffective_skills)),
+                'missing_skills': list(set(missing_skills)),
+                'agent_suggestions': list(set(agent_suggestions))
+            }
 
         except Exception as e:
             self.logger.error(f"Error aggregating improvements: {e}")
-            return []
+            return {
+                'suggestions': [],
+                'ineffective_skills': [],
+                'missing_skills': [],
+                'agent_suggestions': []
+            }
 
-    def apply_improvement(self, project_id: str, trigger: Dict[str, Any], suggestions: List[str]) -> bool:
+    def apply_improvement(self, project_id: str, trigger: Dict[str, Any], improvements: Dict[str, Any]) -> bool:
         """
         改善を適用（別ブランチに）
 
         Args:
             project_id: プロジェクトID
             trigger: トリガー情報
-            suggestions: 改善提案リスト
+            improvements: 改善提案辞書（suggestions, ineffective_skills, missing_skills, agent_suggestions）
 
         Returns:
             成功したらTrue
@@ -261,6 +291,11 @@ class ImprovementEngine:
             branch_name = f"auto-improvement-{timestamp}"
 
             # 改善内容を生成するプロンプト
+            suggestions = improvements.get('suggestions', [])
+            ineffective_skills = improvements.get('ineffective_skills', [])
+            missing_skills = improvements.get('missing_skills', [])
+            agent_suggestions = improvements.get('agent_suggestions', [])
+
             improvement_prompt = f"""## 自動改善タスク - スキル/エージェント最適化
 
 プロジェクト: {project_id}
@@ -270,19 +305,30 @@ class ImprovementEngine:
 詳細: {json.dumps(trigger['details'], indent=2)}
 
 ## 改善提案
-{chr(10).join(f'{i+1}. {s}' for i, s in enumerate(suggestions))}
+{chr(10).join(f'{i+1}. {s}' for i, s in enumerate(suggestions)) if suggestions else '（一般的な改善提案なし）'}
+
+## スキル評価結果
+### 効果のないスキル（削除を検討）:
+{chr(10).join(f'  - {s}' for s in ineffective_skills) if ineffective_skills else '  （なし）'}
+
+### 不足しているスキル（作成を推奨）:
+{chr(10).join(f'  - {s}' for s in missing_skills) if missing_skills else '  （なし）'}
+
+## エージェント改善提案:
+{chr(10).join(f'  - {s}' for s in agent_suggestions) if agent_suggestions else '  （なし）'}
 
 ## 指示
 
 上記の失敗パターンと改善提案に基づいて、以下を実行してください：
 
-### 1. スキル管理
+### 1. スキル管理（最優先）
 - `.claude/skills/` ディレクトリを確認・作成
-- 失敗パターンに対応する新しいスキルファイルを作成
-  * 例: 同じエラーが繰り返される場合、そのエラーハンドリング用スキルを作成
-  * スキルファイル名: `{project_id}-[purpose].sh` または `.py`
-  * スキル内容: 再利用可能なコマンド/パターンを定義
-- 既存スキルの更新または削除（使われていないスキルは削除）
+- **効果のないスキルを削除**:
+{chr(10).join(f'  * {s} を削除または大幅改修' for s in ineffective_skills) if ineffective_skills else '  （削除対象なし）'}
+- **不足しているスキルを作成**:
+{chr(10).join(f'  * {s} を作成' for s in missing_skills) if missing_skills else '  （作成不要）'}
+- スキルファイル命名規則: `{project_id}-[purpose].sh` または `.py`
+- スキル内容: 再利用可能なコマンド/パターンを定義、ドキュメント必須
 
 ### 2. エージェント設定
 - `.claude/agents/` ディレクトリを確認・作成（必要に応じて）
@@ -524,16 +570,19 @@ Improvements applied:
 
         # 改善提案を集約
         run_ids = trigger['details'].get('run_ids', [])
-        suggestions = self.aggregate_improvements(run_ids)
+        improvements = self.aggregate_improvements(run_ids)
 
-        if not suggestions:
+        if not improvements['suggestions'] and not improvements['missing_skills']:
             self.logger.warning(f"No improvement suggestions found for {project_id}")
             return
 
-        self.logger.info(f"Aggregated {len(suggestions)} improvement suggestions")
+        self.logger.info(f"Aggregated improvements: {len(improvements['suggestions'])} suggestions, "
+                        f"{len(improvements['ineffective_skills'])} ineffective skills, "
+                        f"{len(improvements['missing_skills'])} missing skills, "
+                        f"{len(improvements['agent_suggestions'])} agent suggestions")
 
         # 改善を適用
-        success = self.apply_improvement(project_id, trigger, suggestions)
+        success = self.apply_improvement(project_id, trigger, improvements)
 
         if success:
             self.logger.info(f"✓ Improvement applied successfully for {project_id}")

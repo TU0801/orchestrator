@@ -68,6 +68,16 @@ class ToolCallParser:
             r'Searching for pattern[:\s]+([^\n]+)',
             r'Grep\s+tool.*pattern[:\s]+([^\n]+)',
             r'Grepping for[:\s]+([^\n]+)',
+        ],
+        'Skill': [
+            r'Skill\s+tool.*skill[:\s]+"?([^"\n]+)"?',
+            r'Using skill[:\s]+([^\n]+)',
+            r'Invoking skill[:\s]+([^\n]+)',
+        ],
+        'Task': [
+            r'Task\s+tool.*subagent_type[:\s]+"?([^"\n]+)"?',
+            r'Launching agent[:\s]+([^\n]+)',
+            r'Starting.*agent.*[:\s]+([^\n]+)',
         ]
     }
 
@@ -107,6 +117,10 @@ class ToolCallParser:
                         parameters['pattern'] = param_value
                     elif tool_name == 'Grep':
                         parameters['pattern'] = param_value
+                    elif tool_name == 'Skill':
+                        parameters['skill'] = param_value
+                    elif tool_name == 'Task':
+                        parameters['subagent_type'] = param_value
 
                     # ツール呼び出しを記録
                     tool_calls.append({
@@ -129,6 +143,10 @@ class ToolCallParser:
             return 'command_execution'
         elif tool_name in ['Glob', 'Grep']:
             return 'search'
+        elif tool_name == 'Skill':
+            return 'skill_usage'
+        elif tool_name == 'Task':
+            return 'agent_invocation'
         else:
             return 'other'
 
@@ -405,6 +423,19 @@ class TaskExecutor:
     def _perform_self_evaluation(self, run_id: int, task_id: int, instruction: str, output: str, success: bool, exit_code: int):
         """タスク実行結果を自己評価してorch_evaluationsに保存"""
         try:
+            # 使用されたツールを取得
+            tool_calls = ToolCallParser.parse(output)
+            skills_used = [tc for tc in tool_calls if tc['tool_name'] == 'Skill']
+            agents_used = [tc for tc in tool_calls if tc['tool_name'] == 'Task']
+
+            tools_summary = f"\n使用されたスキル ({len(skills_used)}件):\n"
+            for skill in skills_used:
+                tools_summary += f"  - {skill['parameters'].get('skill', 'unknown')}\n"
+
+            tools_summary += f"\n起動されたエージェント ({len(agents_used)}件):\n"
+            for agent in agents_used:
+                tools_summary += f"  - {agent['parameters'].get('subagent_type', 'unknown')}\n"
+
             # 評価プロンプトを構築
             evaluation_prompt = f"""あなたは自分自身の実行を評価するAIです。以下のタスク実行を評価してください。
 
@@ -414,6 +445,9 @@ class TaskExecutor:
 ## 実行結果
 成功: {success}
 終了コード: {exit_code}
+
+## 使用したツール・スキル・エージェント
+{tools_summary}
 
 ## 出力（最初の3000文字）
 {output[:3000]}
@@ -425,7 +459,7 @@ class TaskExecutor:
 ```json
 {{
   "overall_score": <1-10の数値>,
-  "failure_category": "<失敗した場合のカテゴリ: tool_usage_error, permission_error, logic_error, timeout, unknown, または null>",
+  "failure_category": "<失敗した場合のカテゴリ: tool_usage_error, skill_ineffective, agent_misconfigured, permission_error, logic_error, timeout, unknown, または null>",
   "evaluation_details": {{
     "task_completion": "<タスクが完了したかどうか>",
     "quality": "<実装の質>",
@@ -440,6 +474,18 @@ class TaskExecutor:
     "appropriate_tools": <適切なツールを使用したか: true/false>,
     "tool_sequence": "<ツール呼び出しの順序は適切だったか>"
   }},
+  "skill_effectiveness": {{
+    "skills_used": ["<使用したスキル名>"],
+    "effective_skills": ["<効果的だったスキル>"],
+    "ineffective_skills": ["<効果がなかった/問題を起こしたスキル>"],
+    "missing_skills": ["<あれば良かったスキル>"]
+  }},
+  "agent_effectiveness": {{
+    "agents_used": ["<使用したエージェントタイプ>"],
+    "appropriate_agent_choice": <エージェント選択が適切だったか: true/false>,
+    "agent_performance": "<各エージェントのパフォーマンス評価>",
+    "better_agent_suggestion": "<より適切なエージェントがあれば提案>"
+  }},
   "error_patterns": [
     "<検出されたエラーパターン>"
   ]
@@ -449,6 +495,8 @@ class TaskExecutor:
 注意:
 - overall_scoreは1-10で評価（10が最高）
 - 成功した場合はfailure_categoryをnullに
+- スキル・エージェントの効果を具体的に評価すること
+- 効果のないスキルは削除を、不足しているスキルは作成を提案
 - 具体的で実行可能な改善提案を3つ以上
 """
 
@@ -483,6 +531,11 @@ class TaskExecutor:
 
             evaluation_data = json.loads(json_match.group(1))
 
+            # tool_usage_analysisにスキル・エージェント評価を含める
+            tool_usage = evaluation_data.get('tool_usage_analysis', {})
+            tool_usage['skill_effectiveness'] = evaluation_data.get('skill_effectiveness', {})
+            tool_usage['agent_effectiveness'] = evaluation_data.get('agent_effectiveness', {})
+
             # orch_evaluationsに保存
             self.supabase.table('orch_evaluations').insert({
                 'run_id': run_id,
@@ -491,10 +544,21 @@ class TaskExecutor:
                 'failure_category': evaluation_data.get('failure_category'),
                 'evaluation_details': json.dumps(evaluation_data.get('evaluation_details', {})),
                 'improvement_suggestions': json.dumps(evaluation_data.get('improvement_suggestions', [])),
-                'tool_usage_analysis': json.dumps(evaluation_data.get('tool_usage_analysis', {})),
+                'tool_usage_analysis': json.dumps(tool_usage),
                 'error_patterns': json.dumps(evaluation_data.get('error_patterns', [])),
                 'evaluator': 'claude_code'
             }).execute()
+
+            # スキル・エージェント評価のサマリーをログ
+            skill_eff = evaluation_data.get('skill_effectiveness', {})
+            agent_eff = evaluation_data.get('agent_effectiveness', {})
+
+            if skill_eff.get('ineffective_skills'):
+                self.logger.warning(f"Ineffective skills detected: {skill_eff['ineffective_skills']}")
+            if skill_eff.get('missing_skills'):
+                self.logger.info(f"Missing skills suggested: {skill_eff['missing_skills']}")
+            if agent_eff.get('better_agent_suggestion'):
+                self.logger.info(f"Better agent suggestion: {agent_eff['better_agent_suggestion']}")
 
             self.logger.info(f"Self-evaluation saved for run #{run_id}: score={evaluation_data.get('overall_score')}")
 
