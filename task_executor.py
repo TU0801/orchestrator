@@ -215,7 +215,68 @@ class TaskExecutor:
                 self.logger.warning(f"CLAUDE.md読み込みエラー: {e}")
         return None
 
-    def execute_with_claude_code(self, project_id: str, instruction: str) -> tuple[bool, str]:
+    def _create_run_record(self, task_id: int, project_id: str, instruction: str) -> Optional[int]:
+        """orch_runsにレコードを作成し、run_idを返す"""
+        try:
+            result = self.supabase.table('orch_runs').insert({
+                'task_id': task_id,
+                'project_id': project_id,
+                'instruction': instruction,
+                'status': 'running',
+                'timeout_seconds': 600,
+                'claude_code_version': 'latest'
+            }).execute()
+
+            if result.data and len(result.data) > 0:
+                run_id = result.data[0]['id']
+                self.logger.info(f"Run record created: #{run_id}")
+                return run_id
+            else:
+                self.logger.error("Failed to create run record: no data returned")
+                return None
+        except Exception as e:
+            self.logger.error(f"Run record creation error: {e}")
+            return None
+
+    def _complete_run_record(self, run_id: int, success: bool, exit_code: int, output: str, duration_seconds: int):
+        """orch_runsのレコードを更新"""
+        try:
+            # 完全な出力をファイルに保存
+            output_path = self._save_full_output(run_id, output)
+
+            # DBには最初の5000文字のみ保存
+            stdout_preview = output[:5000] if output else ""
+
+            update_data = {
+                'status': 'completed' if success else 'failed',
+                'exit_code': exit_code,
+                'stdout_preview': stdout_preview,
+                'full_output_path': str(output_path) if output_path else None,
+                'completed_at': datetime.now().isoformat(),
+                'duration_seconds': duration_seconds
+            }
+
+            self.supabase.table('orch_runs').update(update_data).eq('id', run_id).execute()
+            self.logger.info(f"Run record #{run_id} updated: {'success' if success else 'failed'}")
+        except Exception as e:
+            self.logger.error(f"Run record update error: {e}")
+
+    def _save_full_output(self, run_id: int, output: str) -> Optional[Path]:
+        """完全な出力をログファイルに保存"""
+        try:
+            log_dir = Path.home() / "orchestrator" / "logs" / "runs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+
+            log_file = log_dir / f"run_{run_id}.log"
+            log_file.write_text(output, encoding='utf-8')
+
+            self.logger.debug(f"Full output saved to: {log_file}")
+            return log_file
+        except Exception as e:
+            self.logger.error(f"Failed to save full output: {e}")
+            return None
+
+    def execute_with_claude_code(self, project_id: str, instruction: str) -> tuple[bool, int, str]:
         """Claude Codeでタスクを実行"""
         # プロジェクトIDとディレクトリ名のマッピング
         project_dir_mapping = {
@@ -232,7 +293,7 @@ class TaskExecutor:
         if not project_dir.exists():
             error_msg = f"プロジェクトディレクトリが見つかりません: {project_dir}"
             self.logger.error(error_msg)
-            return False, error_msg
+            return False, -1, error_msg
 
         # CLAUDE.mdを読む（文脈として）
         claude_md = self.read_claude_md(project_dir)
@@ -299,19 +360,19 @@ orchestrator-dashboardから指示が投入されました。
 
             if result.returncode == 0:
                 self.logger.info("Claude Code実行成功")
-                return True, output[:1000]  # 最初の1000文字を保存
+                return True, result.returncode, output
             else:
                 self.logger.error(f"Claude Code実行失敗（exit code: {result.returncode}）")
-                return False, f"Exit code {result.returncode}: {output[:500]}"
+                return False, result.returncode, output
 
         except subprocess.TimeoutExpired:
             error_msg = "タイムアウト（10分）"
             self.logger.error(error_msg)
-            return False, error_msg
+            return False, -2, error_msg
         except Exception as e:
             error_msg = f"実行エラー: {str(e)}"
             self.logger.error(error_msg)
-            return False, error_msg
+            return False, -3, error_msg
 
     def execute_task(self, task: Dict[str, Any]):
         """タスクを実行"""
@@ -326,23 +387,37 @@ orchestrator-dashboardから指示が投入されました。
         self.logger.info(f"  指示: {instruction}")
         self.logger.info(f"=" * 60)
 
+        # orch_runsにレコードを作成
+        run_id = self._create_run_record(task_id, project_id, instruction)
+
         # ステータスをin_progressに更新
         self.update_task_status(task_id, 'in_progress')
 
-        # Claude Codeで実行
-        success, output = self.execute_with_claude_code(project_id, instruction)
+        # 開始時刻を記録
+        start_time = time.time()
 
-        # 結果を記録
+        # Claude Codeで実行
+        success, exit_code, output = self.execute_with_claude_code(project_id, instruction)
+
+        # 実行時間を計算
+        duration_seconds = int(time.time() - start_time)
+
+        # orch_runsレコードを更新
+        if run_id:
+            self._complete_run_record(run_id, success, exit_code, output, duration_seconds)
+
+        # 結果を記録（既存のタスクステータス更新）
         if success:
-            self.update_task_status(task_id, 'done', f"実行完了\n\n{output}")
+            # 最初の1000文字のみタスクに保存
+            self.update_task_status(task_id, 'done', f"実行完了\n\n{output[:1000]}")
             self.logger.info(f"タスク#{task_id}が完了しました")
             # 次の提案を保存
             self.save_suggestions(project_id, output)
             # プロジェクトサマリーを保存
             self.save_project_summary(project_id, output)
         else:
-            self.update_task_status(task_id, 'failed', f"実行失敗\n\n{output}")
-            self.logger.error(f"タスク#{task_id}が失敗しました: {output}")
+            self.update_task_status(task_id, 'failed', f"実行失敗\n\n{output[:500]}")
+            self.logger.error(f"タスク#{task_id}が失敗しました: {output[:500]}")
 
         self.current_task_id = None
 
