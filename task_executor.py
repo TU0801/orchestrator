@@ -10,6 +10,7 @@ import os
 import sys
 import time
 import json
+import re
 import logging
 import subprocess
 from datetime import datetime
@@ -31,6 +32,105 @@ except ImportError:
     SUPABASE_AVAILABLE = False
     print("⚠️  Supabase SDKがインストールされていません")
     sys.exit(1)
+
+
+class ToolCallParser:
+    """Claude Code出力からツール呼び出しを解析"""
+
+    # ツール呼び出しパターン
+    PATTERNS = {
+        'Read': [
+            r'Reading file[:\s]+([^\n]+)',
+            r'Read\s+tool.*file_path[:\s]+([^\n]+)',
+            r'cat\s+-n\s+([^\s]+)',
+        ],
+        'Write': [
+            r'Writing to file[:\s]+([^\n]+)',
+            r'Write\s+tool.*file_path[:\s]+([^\n]+)',
+            r'Created file[:\s]+([^\n]+)',
+        ],
+        'Edit': [
+            r'Editing file[:\s]+([^\n]+)',
+            r'Edit\s+tool.*file_path[:\s]+([^\n]+)',
+            r'Modified file[:\s]+([^\n]+)',
+        ],
+        'Bash': [
+            r'Running command[:\s]+(.+?)(?:\n|$)',
+            r'Bash\s+tool.*command[:\s]+(.+?)(?:\n|$)',
+            r'Executing[:\s]+(.+?)(?:\n|$)',
+        ],
+        'Glob': [
+            r'Searching for files matching[:\s]+([^\n]+)',
+            r'Glob\s+tool.*pattern[:\s]+([^\n]+)',
+            r'Finding files[:\s]+([^\n]+)',
+        ],
+        'Grep': [
+            r'Searching for pattern[:\s]+([^\n]+)',
+            r'Grep\s+tool.*pattern[:\s]+([^\n]+)',
+            r'Grepping for[:\s]+([^\n]+)',
+        ]
+    }
+
+    @classmethod
+    def parse(cls, output: str) -> list[dict]:
+        """
+        Claude Code出力からツール呼び出しを抽出
+
+        Returns:
+            List of tool calls with format:
+            [
+                {
+                    'tool_name': 'Read',
+                    'parameters': {'file_path': '/path/to/file'},
+                    'success': True,
+                    'sequence_number': 0
+                },
+                ...
+            ]
+        """
+        tool_calls = []
+        sequence_number = 0
+
+        for tool_name, patterns in cls.PATTERNS.items():
+            for pattern in patterns:
+                matches = re.finditer(pattern, output, re.MULTILINE | re.IGNORECASE)
+                for match in matches:
+                    param_value = match.group(1).strip()
+
+                    # パラメータを構築
+                    parameters = {}
+                    if tool_name in ['Read', 'Write', 'Edit']:
+                        parameters['file_path'] = param_value
+                    elif tool_name == 'Bash':
+                        parameters['command'] = param_value
+                    elif tool_name == 'Glob':
+                        parameters['pattern'] = param_value
+                    elif tool_name == 'Grep':
+                        parameters['pattern'] = param_value
+
+                    # ツール呼び出しを記録
+                    tool_calls.append({
+                        'tool_name': tool_name,
+                        'parameters': parameters,
+                        'success': True,  # 出力に含まれている = 実行された
+                        'sequence_number': sequence_number,
+                        'category': cls._categorize_tool(tool_name)
+                    })
+                    sequence_number += 1
+
+        return tool_calls
+
+    @staticmethod
+    def _categorize_tool(tool_name: str) -> str:
+        """ツールをカテゴリ分類"""
+        if tool_name in ['Read', 'Write', 'Edit']:
+            return 'file_operation'
+        elif tool_name == 'Bash':
+            return 'command_execution'
+        elif tool_name in ['Glob', 'Grep']:
+            return 'search'
+        else:
+            return 'other'
 
 
 class TaskExecutor:
@@ -276,6 +376,32 @@ class TaskExecutor:
             self.logger.error(f"Failed to save full output: {e}")
             return None
 
+    def _save_tool_calls(self, run_id: int, output: str):
+        """Claude Code出力からツール呼び出しを抽出してorch_tool_callsに保存"""
+        try:
+            # ツール呼び出しを解析
+            tool_calls = ToolCallParser.parse(output)
+
+            if not tool_calls:
+                self.logger.debug("No tool calls found in output")
+                return
+
+            # orch_tool_callsに保存
+            for tool_call in tool_calls:
+                self.supabase.table('orch_tool_calls').insert({
+                    'run_id': run_id,
+                    'tool_name': tool_call['tool_name'],
+                    'parameters': json.dumps(tool_call['parameters']),
+                    'success': tool_call['success'],
+                    'sequence_number': tool_call['sequence_number'],
+                    'category': tool_call['category']
+                }).execute()
+
+            self.logger.info(f"Saved {len(tool_calls)} tool calls for run #{run_id}")
+
+        except Exception as e:
+            self.logger.error(f"Failed to save tool calls: {e}")
+
     def execute_with_claude_code(self, project_id: str, instruction: str) -> tuple[bool, int, str]:
         """Claude Codeでタスクを実行"""
         # プロジェクトIDとディレクトリ名のマッピング
@@ -405,6 +531,8 @@ orchestrator-dashboardから指示が投入されました。
         # orch_runsレコードを更新
         if run_id:
             self._complete_run_record(run_id, success, exit_code, output, duration_seconds)
+            # ツール呼び出しを解析して保存
+            self._save_tool_calls(run_id, output)
 
         # 結果を記録（既存のタスクステータス更新）
         if success:
