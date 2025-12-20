@@ -1,0 +1,15 @@
+[Unit]
+Description=Orchestrator Improvement Engine
+After=network.target
+
+[Service]
+Type=oneshot
+User=sorakun_fukuoka
+WorkingDirectory=/home/sorakun_fukuoka/orchestrator
+Environment="PATH=/usr/local/bin:/usr/bin:/bin"
+ExecStart=/usr/bin/python3 /home/sorakun_fukuoka/orchestrator/improvement_engine.py
+StandardOutput=append:/home/sorakun_fukuoka/orchestrator/logs/improvement_engine.log
+StandardError=append:/home/sorakun_fukuoka/orchestrator/logs/improvement_engine.log
+
+[Install]
+WantedBy=multi-user.target
