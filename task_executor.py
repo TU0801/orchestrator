@@ -13,6 +13,7 @@ import json
 import re
 import logging
 import subprocess
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -32,6 +33,82 @@ except ImportError:
     SUPABASE_AVAILABLE = False
     print("⚠️  Supabase SDKがインストールされていません")
     sys.exit(1)
+
+
+class ParallelTaskExecutor:
+    """並列タスク実行管理"""
+
+    def __init__(self, max_concurrent: int = 3):
+        """
+        Args:
+            max_concurrent: 最大同時実行数（デフォルト: 3）
+        """
+        self.running_projects: Dict[str, Dict[str, Any]] = {}
+        self.max_concurrent = max_concurrent
+        self.lock = threading.Lock()
+        self.logger = logging.getLogger('ParallelTaskExecutor')
+
+    def can_start_task(self, project_id: str) -> bool:
+        """
+        タスクを開始できるかチェック
+
+        Args:
+            project_id: プロジェクトID
+
+        Returns:
+            開始可能ならTrue
+        """
+        with self.lock:
+            # 同じプロジェクトで実行中なら不可
+            if project_id in self.running_projects:
+                self.logger.info(f"Project {project_id} is already running")
+                return False
+
+            # 最大同時実行数チェック
+            if len(self.running_projects) >= self.max_concurrent:
+                self.logger.info(f"Max concurrent tasks reached ({self.max_concurrent})")
+                return False
+
+            return True
+
+    def register_task(self, project_id: str, run_id: int, thread: threading.Thread):
+        """
+        実行中タスクを登録
+
+        Args:
+            project_id: プロジェクトID
+            run_id: 実行ID
+            thread: 実行スレッド
+        """
+        with self.lock:
+            self.running_projects[project_id] = {
+                'run_id': run_id,
+                'thread': thread,
+                'started_at': datetime.now()
+            }
+            self.logger.info(f"Registered task for {project_id} (run_id: {run_id})")
+
+    def unregister_task(self, project_id: str):
+        """
+        実行完了タスクを登録解除
+
+        Args:
+            project_id: プロジェクトID
+        """
+        with self.lock:
+            if project_id in self.running_projects:
+                del self.running_projects[project_id]
+                self.logger.info(f"Unregistered task for {project_id}")
+
+    def get_running_count(self) -> int:
+        """実行中のタスク数を取得"""
+        with self.lock:
+            return len(self.running_projects)
+
+    def get_running_projects(self) -> list[str]:
+        """実行中のプロジェクトIDリストを取得"""
+        with self.lock:
+            return list(self.running_projects.keys())
 
 
 class ToolCallParser:
@@ -159,6 +236,7 @@ class TaskExecutor:
         self.supabase: Optional[Client] = None
         self.projects_dir = Path.home() / 'projects'
         self.current_task_id: Optional[int] = None
+        self.parallel_executor = ParallelTaskExecutor(max_concurrent=3)
 
     def _setup_logging(self) -> logging.Logger:
         """ロギングを設定"""
@@ -711,56 +789,85 @@ orchestrator-dashboardから指示が投入されました。
             self.logger.error(error_msg)
             return False, -3, error_msg
 
-    def execute_task(self, task: Dict[str, Any]):
-        """タスクを実行"""
+    def _execute_task_internal(self, task: Dict[str, Any]):
+        """タスクを実行（内部処理）"""
         task_id = task['id']
         project_id = task['project_id']
         instruction = task['title']
 
-        self.current_task_id = task_id
-        self.logger.info(f"=" * 60)
-        self.logger.info(f"タスク実行開始: #{task_id}")
-        self.logger.info(f"  プロジェクト: {project_id}")
-        self.logger.info(f"  指示: {instruction}")
-        self.logger.info(f"=" * 60)
+        try:
+            self.current_task_id = task_id
+            self.logger.info(f"=" * 60)
+            self.logger.info(f"タスク実行開始: #{task_id}")
+            self.logger.info(f"  プロジェクト: {project_id}")
+            self.logger.info(f"  指示: {instruction}")
+            self.logger.info(f"=" * 60)
 
-        # orch_runsにレコードを作成
-        run_id = self._create_run_record(task_id, project_id, instruction)
+            # orch_runsにレコードを作成
+            run_id = self._create_run_record(task_id, project_id, instruction)
 
-        # ステータスをin_progressに更新
-        self.update_task_status(task_id, 'in_progress')
+            # ステータスをin_progressに更新
+            self.update_task_status(task_id, 'in_progress')
 
-        # 開始時刻を記録
-        start_time = time.time()
+            # orch_runsのステータスを'running'に更新
+            if run_id:
+                self.supabase.table('orch_runs').update({'status': 'running'}).eq('id', run_id).execute()
 
-        # Claude Codeで実行
-        success, exit_code, output = self.execute_with_claude_code(project_id, instruction)
+            # 開始時刻を記録
+            start_time = time.time()
 
-        # 実行時間を計算
-        duration_seconds = int(time.time() - start_time)
+            # Claude Codeで実行
+            success, exit_code, output = self.execute_with_claude_code(project_id, instruction)
 
-        # orch_runsレコードを更新
-        if run_id:
-            self._complete_run_record(run_id, success, exit_code, output, duration_seconds)
-            # ツール呼び出しを解析して保存
-            self._save_tool_calls(run_id, output)
-            # 自己評価を実行
-            self._perform_self_evaluation(run_id, task_id, instruction, output, success, exit_code)
+            # 実行時間を計算
+            duration_seconds = int(time.time() - start_time)
 
-        # 結果を記録（既存のタスクステータス更新）
-        if success:
-            # 最初の1000文字のみタスクに保存
-            self.update_task_status(task_id, 'done', f"実行完了\n\n{output[:1000]}")
-            self.logger.info(f"タスク#{task_id}が完了しました")
-            # 次の提案を保存
-            self.save_suggestions(project_id, output)
-            # プロジェクトサマリーを保存
-            self.save_project_summary(project_id, output)
-        else:
-            self.update_task_status(task_id, 'failed', f"実行失敗\n\n{output[:500]}")
-            self.logger.error(f"タスク#{task_id}が失敗しました: {output[:500]}")
+            # orch_runsレコードを更新
+            if run_id:
+                self._complete_run_record(run_id, success, exit_code, output, duration_seconds)
+                # ツール呼び出しを解析して保存
+                self._save_tool_calls(run_id, output)
+                # 自己評価を実行
+                self._perform_self_evaluation(run_id, task_id, instruction, output, success, exit_code)
 
-        self.current_task_id = None
+            # 結果を記録（既存のタスクステータス更新）
+            if success:
+                # 最初の1000文字のみタスクに保存
+                self.update_task_status(task_id, 'done', f"実行完了\n\n{output[:1000]}")
+                self.logger.info(f"タスク#{task_id}が完了しました")
+                # 次の提案を保存
+                self.save_suggestions(project_id, output)
+                # プロジェクトサマリーを保存
+                self.save_project_summary(project_id, output)
+            else:
+                self.update_task_status(task_id, 'failed', f"実行失敗\n\n{output[:500]}")
+                self.logger.error(f"タスク#{task_id}が失敗しました: {output[:500]}")
+
+            self.current_task_id = None
+
+        finally:
+            # 実行完了後、並列実行管理から削除
+            self.parallel_executor.unregister_task(project_id)
+
+    def execute_task_async(self, task: Dict[str, Any]):
+        """タスクを非同期（別スレッド）で実行"""
+        project_id = task['project_id']
+
+        # 実行可能かチェック
+        if not self.parallel_executor.can_start_task(project_id):
+            self.logger.warning(f"Cannot start task for {project_id}: already running or max concurrent reached")
+            return False
+
+        # スレッドを作成して実行
+        thread = threading.Thread(target=self._execute_task_internal, args=(task,), daemon=True)
+        thread.start()
+
+        # run_idはまだ作成されていないので、ダミー値で登録
+        # （実際の run_id は _execute_task_internal 内で作成される）
+        self.parallel_executor.register_task(project_id, 0, thread)
+
+        self.logger.info(f"Started task for {project_id} in background thread")
+        return True
 
     def run(self):
         """メインループ"""
@@ -776,22 +883,33 @@ orchestrator-dashboardから指示が投入されました。
 
         while True:
             try:
+                # 実行中のタスク数を表示
+                running_count = self.parallel_executor.get_running_count()
+                if running_count > 0:
+                    running_projects = self.parallel_executor.get_running_projects()
+                    self.logger.info(f"実行中: {running_count}件 (プロジェクト: {', '.join(running_projects)})")
+
                 # pendingタスクを取得
                 tasks = self.get_pending_tasks()
 
                 if tasks:
                     self.logger.info(f"{len(tasks)}件のpendingタスクを検出")
 
-                    # 1件ずつ実行（同時実行は1タスクまで）
+                    # 並列実行（最大3件まで同時実行）
                     for task in tasks:
-                        self.execute_task(task)
-                        # タスク間に少し待機
-                        time.sleep(5)
+                        # 非同期で実行（開始可能なら即座に返る）
+                        started = self.execute_task_async(task)
+                        if started:
+                            self.logger.info(f"タスク#{task['id']}をバックグラウンドで開始")
+                        else:
+                            self.logger.debug(f"タスク#{task['id']}はスキップ（実行中または最大同時実行数に達している）")
+                        # 少し待機してから次のタスクをチェック
+                        time.sleep(2)
                 else:
                     self.logger.debug("pendingタスクなし")
 
-                # 1分待機
-                time.sleep(60)
+                # 10秒待機（ポーリング間隔を短縮）
+                time.sleep(10)
 
             except KeyboardInterrupt:
                 self.logger.info("中断されました")
