@@ -793,14 +793,19 @@ orchestrator-dashboardから指示が投入されました。
         """タスクを実行（内部処理）"""
         task_id = task['id']
         project_id = task['project_id']
-        instruction = task['title']
+
+        # descriptionがあればそれを使い、なければtitleを使う
+        description = task.get('description', '').strip()
+        instruction = description if description else task['title']
 
         try:
             self.current_task_id = task_id
             self.logger.info(f"=" * 60)
             self.logger.info(f"タスク実行開始: #{task_id}")
             self.logger.info(f"  プロジェクト: {project_id}")
-            self.logger.info(f"  指示: {instruction}")
+            self.logger.info(f"  タイトル: {task['title']}")
+            if description:
+                self.logger.info(f"  詳細指示: {description[:100]}..." if len(description) > 100 else f"  詳細指示: {description}")
             self.logger.info(f"=" * 60)
 
             # orch_runsにレコードを作成
