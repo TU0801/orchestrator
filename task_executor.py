@@ -743,30 +743,19 @@ orchestrator-dashboardから指示が投入されました。
             temp_instruction_file = Path('/tmp') / f'orchestrator_task_{self.current_task_id}.txt'
             temp_instruction_file.write_text(full_instruction, encoding='utf-8')
 
-            # Step 1: Resumeを試みる
-            self.logger.info(f"Trying to resume session: {session_name}")
-            resume_cmd = f'cd {project_dir} && cat {temp_instruction_file} | claude --resume {session_name} --dangerously-skip-permissions --print'
+            # セッションを作成または継続（--sessionは自動的に既存セッションを再開する）
+            self.logger.info(f"Using session: {session_name}")
+            session_cmd = f'cd {project_dir} && cat {temp_instruction_file} | claude --session {session_name} --dangerously-skip-permissions --print'
 
             result = subprocess.run(
-                ['bash', '-c', resume_cmd],
+                ['bash', '-c', session_cmd],
                 capture_output=True,
                 text=True,
                 timeout=600  # 10分でタイムアウト
             )
 
-            # Resumeが失敗した場合は新規セッションで再試行
-            if result.returncode != 0 and ('session not found' in result.stderr.lower() or 'no such session' in result.stderr.lower()):
-                self.logger.info(f"Resume failed, starting new session with name: {session_name}")
-                new_session_cmd = f'cd {project_dir} && cat {temp_instruction_file} | claude --session {session_name} --dangerously-skip-permissions --print'
-
-                result = subprocess.run(
-                    ['bash', '-c', new_session_cmd],
-                    capture_output=True,
-                    text=True,
-                    timeout=600
-                )
-            elif result.returncode == 0:
-                self.logger.info(f"Successfully resumed session: {session_name}")
+            if result.returncode == 0:
+                self.logger.info(f"✓ Session executed successfully: {session_name}")
 
             # 一時ファイルを削除
             temp_instruction_file.unlink(missing_ok=True)
@@ -791,11 +780,17 @@ orchestrator-dashboardから指示が投入されました。
 
     def _execute_task_internal(self, task: Dict[str, Any]):
         """タスクを実行（内部処理）"""
+        # Safety check
+        if task is None:
+            self.logger.error("❌ Task is None in _execute_task_internal!")
+            return
+
         task_id = task['id']
         project_id = task['project_id']
 
         # descriptionがあればそれを使い、なければtitleを使う
-        description = task.get('description', '').strip()
+        description = task.get('description') or ''
+        description = description.strip() if description else ''
         instruction = description if description else task['title']
 
         try:
