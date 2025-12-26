@@ -451,8 +451,7 @@ class TaskExecutor:
                 'project_id': project_id,
                 'instruction': instruction,
                 'status': 'running',
-                'timeout_seconds': 600,
-                'claude_code_version': 'latest'
+                'timeout_seconds': 600
             }).execute()
 
             if result.data and len(result.data) > 0:
@@ -743,19 +742,21 @@ orchestrator-dashboardから指示が投入されました。
             temp_instruction_file = Path('/tmp') / f'orchestrator_task_{self.current_task_id}.txt'
             temp_instruction_file.write_text(full_instruction, encoding='utf-8')
 
-            # セッションを作成または継続（--sessionは自動的に既存セッションを再開する）
-            self.logger.info(f"Using session: {session_name}")
-            session_cmd = f'cd {project_dir} && cat {temp_instruction_file} | claude --session {session_name} --dangerously-skip-permissions --print'
+            # Claude Codeを--printモードで実行
+            # Note: --printモードではセッション永続化はサポートされていない (--no-session-persistence)
+            # 各タスクは独立して実行される
+            self.logger.info(f"Executing task (session disabled in --print mode)")
+            claude_cmd = f'cd {project_dir} && cat {temp_instruction_file} | claude --dangerously-skip-permissions --print'
 
             result = subprocess.run(
-                ['bash', '-c', session_cmd],
+                ['bash', '-c', claude_cmd],
                 capture_output=True,
                 text=True,
                 timeout=600  # 10分でタイムアウト
             )
 
             if result.returncode == 0:
-                self.logger.info(f"✓ Session executed successfully: {session_name}")
+                self.logger.info(f"✓ Task executed successfully")
 
             # 一時ファイルを削除
             temp_instruction_file.unlink(missing_ok=True)
